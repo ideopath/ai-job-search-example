@@ -2,8 +2,6 @@
 """scrape_jobs.py - pull a company's job board and emit normalized markdown
 for downstream fit analysis.
 
-{chazr note: this file was authored and is maintained by Claude. I disavow any responsibility for its contents.}
-
 Two-phase design:
   Phase 1 (index)  - cheap fetches pull every listing's title + URL + location.
   Phase 2 (detail) - only shortlisted roles get their full prose fetched.
@@ -18,6 +16,10 @@ Supported ATSes:
                    per line in --urls-file). Google has no public board API; the HTML is
                    SSR'd with the job prose inline, so we fetch each URL and extract
                    Title/Location/Salary/About/Responsibilities/Min/Pref qualifications.
+  tiktok-urls      lifeattiktok.com/search/{id} (one URL per line in --urls-file).
+                   SSR'd Next.js pages. UNVALIDATED against raw HTML as of 2026-07-13
+                   (written while the domain was proxy-blocked) — smoke-test one URL
+                   before a batch run. See JOB_HUNT_WORKFLOW.md "Known rough edges".
 
 Usage:
   python scripts/scrape_jobs.py \\
@@ -918,6 +920,179 @@ def fetch_stripe_urls(urls, sleep_s=1.0):
     return out
 
 
+# ---- TikTok (lifeattiktok.com, URL-list mode) ----------------------------
+#
+# lifeattiktok.com/search/{id} is a Next.js careers site. Listing pages are
+# SSR'd (verified 2026-07-13 via a rendered-text fetch of
+# /search/7208432033885833531 — title, location, employment type, job code,
+# responsibilities, qualifications, and salary all present server-side).
+#
+# CAVEAT: this parser was written while the sandbox egress proxy still
+# blocked lifeattiktok.com, so it has NOT been validated against the raw
+# HTML — only against the rendered text. Strategy, most-structured first:
+#   1. __NEXT_DATA__ JSON blob (pages-router Next.js) — walk it for a dict
+#      with title/description-shaped keys.
+#   2. Plain-text marker slicing on the tag-stripped page, keyed on the
+#      labels observed in the rendered listing:
+#        "Location:" / "Employment Type:" / "Job Code:"
+#        "Responsibilities" ... "Qualifications" ... "Job Information"
+#      Salary sentence: "The base salary range for this position in the
+#      selected city is $X - $Y annually."
+# Smoke-test ONE URL and inspect full.md before the first batch run.
+# Apply URL is constructible: careers.tiktok.com/resume/{id}/apply
+
+_TIKTOK_ID_RE = re.compile(r"/search/(\d+)")
+_TIKTOK_OG_TITLE_RE = re.compile(
+    r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', re.I)
+_TIKTOK_TITLE_TAG_RE = re.compile(r"<title>([^<]+)</title>", re.I)
+_TIKTOK_NEXT_DATA_RE = re.compile(
+    r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.DOTALL)
+_TIKTOK_FIELD_RES = {
+    "location": re.compile(r"^Location:\s*\n+\s*(.+)$", re.M),
+    "employment_type": re.compile(r"^Employment Type:\s*\n+\s*(.+)$", re.M),
+    "job_code": re.compile(r"^Job Code:\s*\n+\s*(\S+)$", re.M),
+}
+_TIKTOK_SALARY_RE = re.compile(
+    r"base salary range for this position[^$]*?is\s*\$\s*([\d,]+)\s*[-–]\s*\$?\s*([\d,]+)",
+    re.I)
+_TIKTOK_SECTION_MARKERS = ("Responsibilities", "Qualifications", "Job Information")
+
+
+def _tiktok_walk_next_data(node):
+    """DFS the __NEXT_DATA__ blob for a job-posting-shaped dict."""
+    if isinstance(node, dict):
+        keys = {k.lower() for k in node}
+        if ("title" in keys or "job_title" in keys) and (
+                "description" in keys or "requirement" in keys
+                or "job_description" in keys):
+            return node
+        for v in node.values():
+            hit = _tiktok_walk_next_data(v)
+            if hit:
+                return hit
+    elif isinstance(node, list):
+        for v in node:
+            hit = _tiktok_walk_next_data(v)
+            if hit:
+                return hit
+    return None
+
+
+def _tiktok_text_section(text, start_marker, end_markers):
+    """Slice stripped text from a line equal to start_marker to the next end marker."""
+    m = re.search(rf"^\**{start_marker}\**\s*$", text, re.M)
+    if not m:
+        return ""
+    rest = text[m.end():]
+    cut = len(rest)
+    for em in end_markers:
+        em_m = re.search(rf"^\**{em}\**\s*$", rest, re.M)
+        if em_m:
+            cut = min(cut, em_m.start())
+    return rest[:cut].strip()
+
+
+def parse_tiktok_listing(html_text, url):
+    id_m = _TIKTOK_ID_RE.search(url)
+    job_id = id_m.group(1) if id_m else ""
+    apply_link = f"https://careers.tiktok.com/resume/{job_id}/apply" if job_id else ""
+
+    title_m = _TIKTOK_OG_TITLE_RE.search(html_text) or _TIKTOK_TITLE_TAG_RE.search(html_text)
+    title = htmllib.unescape(title_m.group(1)).strip() if title_m else ""
+
+    # Attempt 1: __NEXT_DATA__ structured blob.
+    job = None
+    nd_m = _TIKTOK_NEXT_DATA_RE.search(html_text)
+    if nd_m:
+        try:
+            job = _tiktok_walk_next_data(json.loads(nd_m.group(1)))
+        except json.JSONDecodeError:
+            job = None
+
+    body = re.sub(r"<script[^>]*>.*?</script>", "", html_text, flags=re.S)
+    body = re.sub(r"<style[^>]*>.*?</style>", "", body, flags=re.S)
+    text = strip_html(body)
+
+    fields = {}
+    for key, rx in _TIKTOK_FIELD_RES.items():
+        f_m = rx.search(text)
+        fields[key] = f_m.group(1).strip() if f_m else ""
+
+    parts = []
+    if job:
+        # Structured path: key names unverified — take the plausible ones.
+        title = title or (job.get("title") or job.get("job_title") or "").strip()
+        desc = job.get("description") or job.get("job_description") or ""
+        req = job.get("requirement") or job.get("requirements") or ""
+        if desc:
+            parts.append("**Responsibilities**\n\n" + strip_html(str(desc)))
+        if req:
+            parts.append("**Qualifications**\n\n" + strip_html(str(req)))
+
+    if not parts:
+        # Attempt 2: plain-text marker slicing.
+        resp = _tiktok_text_section(text, "Responsibilities", _TIKTOK_SECTION_MARKERS[1:])
+        quals = _tiktok_text_section(text, "Qualifications", _TIKTOK_SECTION_MARKERS[2:])
+        if resp:
+            parts.append("**Responsibilities**\n\n" + resp)
+        if quals:
+            parts.append("**Qualifications**\n\n" + quals)
+
+    sal_m = _TIKTOK_SALARY_RE.search(text)
+    pay_range = ""
+    if sal_m:
+        lo = int(sal_m.group(1).replace(",", ""))
+        hi = int(sal_m.group(2).replace(",", ""))
+        pay_range = f"${lo:,} - ${hi:,} USD"
+
+    if not parts:
+        parts.append("(no Responsibilities/Qualifications sections found — "
+                      "parser unvalidated against raw HTML; inspect the page "
+                      "structure and fix _TIKTOK_* regexes)")
+    if fields["employment_type"]:
+        parts.append(f"**Employment type:** {fields['employment_type']}")
+    if fields["job_code"]:
+        parts.append(f"**Job code:** {fields['job_code']}")
+    if apply_link:
+        parts.append(f"**Apply:** {apply_link}")
+
+    loc_str = fields["location"]
+    return {
+        "id": job_id,
+        "title": title,
+        "url": url,
+        "locations": [s.strip() for s in re.split(r"[|;,]", loc_str) if s.strip()],
+        "location_str": loc_str,
+        "department": "TikTok",
+        "updated_at": "",
+        "pay_range": pay_range,
+        "content_text": "\n\n".join(parts).strip(),
+        "_source": "tiktok-urls",
+    }
+
+
+def fetch_tiktok_urls(urls, sleep_s=1.0):
+    out = []
+    for i, url in enumerate(urls, 1):
+        try:
+            html_text = _get_text(url)
+            listing = parse_tiktok_listing(html_text, url)
+            out.append(listing)
+            print(f"  [{i}/{len(urls)}] {listing['title'][:60]} | {listing['location_str']} | {listing['pay_range']}", file=sys.stderr)
+        except Exception as e:
+            out.append({
+                "id": "", "title": url.rsplit("/", 1)[-1], "url": url,
+                "locations": [], "location_str": "", "department": "TikTok",
+                "updated_at": "", "pay_range": "",
+                "content_text": f"(fetch failed: {type(e).__name__}: {e})",
+                "_source": "tiktok-urls",
+            })
+            print(f"  [{i}/{len(urls)}] FAIL {url}: {e}", file=sys.stderr)
+        if i < len(urls) and sleep_s:
+            time.sleep(sleep_s)
+    return out
+
+
 # ---- Lever ---------------------------------------------------------------
 
 def fetch_lever(company):
@@ -1061,6 +1236,14 @@ def fetch_all(company, ats, urls_file=None):
         if not urls:
             raise SystemExit(f"no URLs found in {urls_file!r}")
         return fetch_snap_urls(urls), "done"
+    if ats == "tiktok-urls":
+        if not urls_file:
+            raise SystemExit("--ats tiktok-urls requires --urls-file")
+        urls = [ln.strip() for ln in pathlib.Path(urls_file).read_text().splitlines()
+                if ln.strip() and not ln.strip().startswith("#")]
+        if not urls:
+            raise SystemExit(f"no URLs found in {urls_file!r}")
+        return fetch_tiktok_urls(urls), "done"
     if ats == "stripe-urls":
         if not urls_file:
             raise SystemExit("--ats stripe-urls requires --urls-file")
@@ -1078,11 +1261,11 @@ def main(argv=None):
     p.add_argument("--ats", default="greenhouse",
                    choices=["greenhouse", "greenhouse-api", "greenhouse-html", "lever",
                             "google-urls", "microsoft-urls", "openai-urls", "snap-urls",
-                            "stripe-urls"])
+                            "stripe-urls", "tiktok-urls"])
     p.add_argument("--location", default="")
     p.add_argument("--keywords", default="")
     p.add_argument("--urls-file", default="",
-                   help="Path to text file with one listing URL per line (for --ats google-urls, microsoft-urls, openai-urls, snap-urls, or stripe-urls).")
+                   help="Path to text file with one listing URL per line (for --ats google-urls, microsoft-urls, openai-urls, snap-urls, stripe-urls, or tiktok-urls).")
     p.add_argument("--out-dir", required=True)
     args = p.parse_args(argv)
 
