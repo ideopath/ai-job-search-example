@@ -426,6 +426,114 @@ def fetch_microsoft_urls(urls, sleep_s=1.0):
     return out
 
 
+# ---- Netflix (Eightfold-powered, URL-list mode) ---------------------------
+#
+# explore.jobs.netflix.net is an Eightfold AI front-end (same platform family
+# as apply.careers.microsoft.com, same /careers/job/{id} URL shape). Verified
+# 2026-07-14 against /careers/job/790298014263:
+#   - JSON-LD JobPosting blob present with title, full description prose,
+#     datePosted, validThrough, employmentType.
+#   - CAVEAT: JSON-LD jobLocation is GEO-PERSONALIZED to the requester's IP
+#     (sandbox saw "Panamá, PA" for a USA-Remote role). Do NOT trust it.
+#   - The REAL location lives in og:title:
+#       "<role title> | <location> | Netflix"
+#   - Salary lives in the description prose:
+#       "The range for this role is $600,000.00 - $1,066,000.00."
+#     (also handle the "overall market range for roles in this area" variant).
+
+_NFLX_OG_TITLE_RE = re.compile(
+    r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', re.I)
+_NFLX_ID_RE = re.compile(r"/careers/job/(\d+)")
+_NFLX_SALARY_RE = re.compile(
+    r"range for (?:this role|roles in this area[^$]{0,80}) is[^$]{0,40}"
+    r"\$\s*([\d,]+(?:\.\d+)?)\s*[-–]\s*\$?\s*([\d,]+(?:\.\d+)?)",
+    re.I,
+)
+
+
+def parse_netflix_listing(html_text, url):
+    id_m = _NFLX_ID_RE.search(url)
+    job_id = id_m.group(1) if id_m else ""
+
+    posting = None
+    for m in _MSFT_LDJSON_RE.finditer(html_text):
+        try:
+            data = json.loads(m.group(1).strip())
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and data.get("@type") == "JobPosting":
+            posting = data
+            break
+
+    # Title + location from og:title: "<title> | <location> | Netflix"
+    title, loc_str = "", ""
+    og_m = _NFLX_OG_TITLE_RE.search(html_text)
+    if og_m:
+        parts = [p.strip() for p in htmllib.unescape(og_m.group(1)).split("|")]
+        if parts and parts[-1].lower() == "netflix":
+            parts = parts[:-1]
+        if len(parts) >= 2:
+            title, loc_str = " | ".join(parts[:-1]), parts[-1]
+        elif parts:
+            title = parts[0]
+
+    if not posting:
+        return {
+            "id": job_id, "title": title, "url": url,
+            "locations": [loc_str] if loc_str else [],
+            "location_str": loc_str, "department": "Netflix",
+            "updated_at": "", "valid_through": "", "pay_range": "",
+            "content_text": "(JobPosting JSON-LD not found in HTML)",
+            "_source": "netflix-urls",
+        }
+
+    title = title or (posting.get("title") or "").strip()
+    description = strip_html(posting.get("description") or "")
+
+    sal_m = _NFLX_SALARY_RE.search(description)
+    pay_range = ""
+    if sal_m:
+        lo = int(float(sal_m.group(1).replace(",", "")))
+        hi = int(float(sal_m.group(2).replace(",", "")))
+        pay_range = f"${lo:,} - ${hi:,} USD"
+
+    return {
+        "id": job_id,
+        "title": title,
+        "url": url,
+        "locations": [loc_str] if loc_str else [],
+        "location_str": loc_str,  # from og:title; JSON-LD location is geo-junk
+        "department": "Netflix",
+        "updated_at": posting.get("datePosted", ""),
+        "valid_through": posting.get("validThrough", ""),
+        "pay_range": pay_range,
+        "content_text": description,
+        "_source": "netflix-urls",
+    }
+
+
+def fetch_netflix_urls(urls, sleep_s=1.0):
+    out = []
+    for i, url in enumerate(urls, 1):
+        try:
+            html_text = _get_text(url)
+            listing = parse_netflix_listing(html_text, url)
+            out.append(listing)
+            print(f"  [{i}/{len(urls)}] {listing['title'][:60]} | {listing['location_str']} | {listing['pay_range']}", file=sys.stderr)
+        except Exception as e:
+            out.append({
+                "id": "", "title": url.rsplit("/", 1)[-1], "url": url,
+                "locations": [], "location_str": "", "department": "Netflix",
+                "updated_at": "", "valid_through": "", "pay_range": "",
+                "content_text": f"(fetch failed: {type(e).__name__}: {e})",
+                "_source": "netflix-urls",
+            })
+            print(f"  [{i}/{len(urls)}] FAIL {url}: {e}", file=sys.stderr)
+        if i < len(urls) and sleep_s:
+            time.sleep(sleep_s)
+    return out
+
+
 # ---- OpenAI (Next.js careers site, URL-list mode) ------------------------
 #
 # openai.com/careers/* is a Next.js App Router page. The job prose is shipped
@@ -1220,6 +1328,14 @@ def fetch_all(company, ats, urls_file=None):
         if not urls:
             raise SystemExit(f"no URLs found in {urls_file!r}")
         return fetch_microsoft_urls(urls), "done"
+    if ats == "netflix-urls":
+        if not urls_file:
+            raise SystemExit("--ats netflix-urls requires --urls-file")
+        urls = [ln.strip() for ln in pathlib.Path(urls_file).read_text().splitlines()
+                if ln.strip() and not ln.strip().startswith("#")]
+        if not urls:
+            raise SystemExit(f"no URLs found in {urls_file!r}")
+        return fetch_netflix_urls(urls), "done"
     if ats == "openai-urls":
         if not urls_file:
             raise SystemExit("--ats openai-urls requires --urls-file")
@@ -1260,8 +1376,8 @@ def main(argv=None):
     p.add_argument("--company", required=True)
     p.add_argument("--ats", default="greenhouse",
                    choices=["greenhouse", "greenhouse-api", "greenhouse-html", "lever",
-                            "google-urls", "microsoft-urls", "openai-urls", "snap-urls",
-                            "stripe-urls", "tiktok-urls"])
+                            "google-urls", "microsoft-urls", "netflix-urls", "openai-urls",
+                            "snap-urls", "stripe-urls", "tiktok-urls"])
     p.add_argument("--location", default="")
     p.add_argument("--keywords", default="")
     p.add_argument("--urls-file", default="",
