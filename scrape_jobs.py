@@ -121,7 +121,7 @@ def fetch_greenhouse_api(company):
 # Mountain View). Prefer location.name; offices is fallback only.
 # Multi-location postings separate with ";" in location.name.
 
-_GH_URL_JID_RE = re.compile(r"(?:[?&]gh_jid=|-)(\d{7,})(?:[/?#]|$)")
+_GH_URL_JID_RE = re.compile(r"(?:[?&]gh_jid=|[-/])(\d{7,})(?:[/?#]|$)")
 _GH_PAY_RANGE_DIV_RE = re.compile(
     r'class="pay-range"[^>]*>\s*<span[^>]*>\$?\s*([\d,]+)\s*</span>.*?'
     r'<span[^>]*>\$?\s*([\d,]+)\s*(?:USD)?\s*</span>',
@@ -1300,6 +1300,267 @@ def fetch_tiktok_urls(urls, sleep_s=1.0):
     return out
 
 
+# ---- Oracle (careers.oracle.com, ORC-powered, URL-list mode) --------------
+#
+# careers.oracle.com is a pure client-rendered Oracle Recruiting Cloud (ORC)
+# shell -- only og: tags are server-side. All data comes from the ORC REST
+# API on eeho.fa.us2.oraclecloud.com (must be on the sandbox egress
+# allowlist). Validated 2026-07-15 against requisition 336161:
+#   GET https://eeho.fa.us2.oraclecloud.com/hcmRestApi/resources/latest/
+#       recruitingCEJobRequisitionDetails?onlyData=true&expand=all
+#       &finder=ById;siteNumber=CX_45001,Id=%22{id}%22
+# NOTE: the scaas/v1.3 path from the 2026-07-15 recon 404s at the WebLogic
+# level -- the live tree is /hcmRestApi/resources/latest/ (11.13.18.05).
+# Useful fields: Title, PrimaryLocation, secondaryLocations[].Name,
+#   ExternalDescriptionStr / ExternalResponsibilitiesStr /
+#   ExternalQualificationsStr / CorporateDescriptionStr (all HTML),
+#   Category, JobFunction, ExternalPostedStartDate,
+#   requisitionFlexFields ([{Prompt, Value}] -- Role, Job Type, ...).
+# Salary lives in prose: "US: Hiring Range in USD from: $X to $Y per annum."
+# Job ID = trailing number in careers.oracle.com/en/sites/jobsearch/job/{id}/
+
+_ORACLE_ID_RE = re.compile(r"/job/(\d+)")
+_ORACLE_API = (
+    "https://eeho.fa.us2.oraclecloud.com/hcmRestApi/resources/latest/"
+    "recruitingCEJobRequisitionDetails?onlyData=true&expand=all"
+    "&finder=ById;siteNumber=CX_45001,Id=%22{id}%22"
+)
+_ORACLE_SALARY_RE = re.compile(
+    r"US:\s*Hiring Range(?:\s+in USD)?\s+from:?\s*\$\s*([\d,]+(?:\.\d+)?)\s*"
+    r"(?:to|[-–])\s*\$?\s*([\d,]+(?:\.\d+)?)",
+    re.I,
+)
+
+
+def fetch_oracle_job(job_id):
+    data = _get_json(_ORACLE_API.format(id=job_id))
+    items = data.get("items") or []
+    if not items:
+        raise ValueError(f"no requisition returned for Id={job_id}")
+    it = items[0]
+
+    locs = []
+    if it.get("PrimaryLocation"):
+        locs.append(it["PrimaryLocation"].strip())
+    for sec in it.get("secondaryLocations") or []:
+        n = (sec.get("Name") or "").strip()
+        if n and n not in locs:
+            locs.append(n)
+
+    parts = []
+    for label, html_str in [
+        ("Description", it.get("ExternalDescriptionStr")),
+        ("Responsibilities", it.get("ExternalResponsibilitiesStr")),
+        ("Qualifications", it.get("ExternalQualificationsStr")),
+        ("About Oracle / pay & benefits", it.get("CorporateDescriptionStr")),
+    ]:
+        if html_str:
+            parts.append(f"**{label}**\n\n" + strip_html(html_str))
+
+    flex = [f"{f['Prompt']}: {f['Value']}"
+            for f in (it.get("requisitionFlexFields") or [])
+            if f.get("Prompt") and f.get("Value")]
+    if flex:
+        parts.append("**Requisition attributes:** " + " | ".join(flex))
+
+    all_text = "\n\n".join(parts)
+    pay_range = ""
+    m = _ORACLE_SALARY_RE.search(all_text)
+    if m:
+        lo = int(float(m.group(1).replace(",", "")))
+        hi = int(float(m.group(2).replace(",", "")))
+        pay_range = f"${lo:,} - ${hi:,} USD"
+
+    return {
+        "id": str(it.get("Id") or job_id),
+        "title": (it.get("Title") or "").strip(),
+        "url": f"https://careers.oracle.com/en/sites/jobsearch/job/{job_id}/",
+        "locations": locs,
+        "location_str": " | ".join(locs),
+        "department": (it.get("Category") or it.get("JobFunction") or "Oracle").strip(),
+        "updated_at": it.get("ExternalPostedStartDate") or "",
+        "pay_range": pay_range,
+        "content_text": all_text.strip(),
+        "_source": "oracle-urls",
+    }
+
+
+def fetch_oracle_urls(urls, sleep_s=1.0):
+    out = []
+    for i, url in enumerate(urls, 1):
+        jid_m = _ORACLE_ID_RE.search(url)
+        if not jid_m:
+            out.append({
+                "id": "", "title": url.rsplit("/", 1)[-1], "url": url,
+                "locations": [], "location_str": "", "department": "Oracle",
+                "updated_at": "", "pay_range": "",
+                "content_text": "(no Oracle job ID found in URL)",
+                "_source": "oracle-urls",
+            })
+            print(f"  [{i}/{len(urls)}] SKIP no oracle job id: {url}", file=sys.stderr)
+            continue
+        jid = jid_m.group(1)
+        try:
+            listing = fetch_oracle_job(jid)
+            listing["url"] = url.strip()
+            out.append(listing)
+            print(f"  [{i}/{len(urls)}] {listing['title'][:60]} | {listing['location_str'][:40]} | {listing['pay_range']}", file=sys.stderr)
+        except Exception as e:
+            out.append({
+                "id": jid, "title": url.rsplit("/", 1)[-1], "url": url,
+                "locations": [], "location_str": "", "department": "Oracle",
+                "updated_at": "", "pay_range": "",
+                "content_text": f"(fetch failed: {type(e).__name__}: {e})",
+                "_source": "oracle-urls",
+            })
+            print(f"  [{i}/{len(urls)}] FAIL {url}: {e}", file=sys.stderr)
+        if i < len(urls) and sleep_s:
+            time.sleep(sleep_s)
+    return out
+
+
+# ---- Apple (jobs.apple.com, URL-list mode) --------------------------------
+#
+# Validated 2026-07-15 against 28 listings (jobs_apple_july.txt batch).
+# Pages are SSR'd: full job data lives in a
+#   window.__staticRouterHydrationData = JSON.parse("...")
+# blob at loaderData.jobDetails.jobsData with structured fields:
+#   postingTitle, jobSummary, description, responsibilities,
+#   minimumQualifications, preferredQualifications, locations[]
+#   (city/stateProvince -- the real posted locations), teamNames[],
+#   postDateInGMT, employmentType.
+# Salary lives in postingFooters[].localizations.en_US[] where
+# name == "Pay & Benefits": "The base pay range for this role is between
+# $X and $Y" (base only; RSU/ESPP boilerplate follows in prose).
+# Job ID: /details/{id}-{postingIdentifier}/. Use a browser UA (Akamai).
+
+_APPLE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+             "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+
+
+def _apple_get_text(url, timeout=30):
+    req = urllib.request.Request(url, headers={"User-Agent": _APPLE_UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+
+_APPLE_ID_RE = re.compile(r"/details/(\d+(?:-\d+)?)")
+_APPLE_HYDRATION_RE = re.compile(
+    r'window\.__staticRouterHydrationData\s*=\s*JSON\.parse\("(.*)"\);')
+_APPLE_PAY_RE = re.compile(
+    r"\$\s*([\d,]+(?:\.\d+)?)\s*(?:and|to|[-–])\s*\$\s*([\d,]+(?:\.\d+)?)")
+
+
+def parse_apple_listing(html_text, url):
+    id_m = _APPLE_ID_RE.search(url)
+    job_id = id_m.group(1) if id_m else ""
+
+    def fail(msg):
+        return {
+            "id": job_id, "title": url.rsplit("/", 2)[-2] if "/" in url else url,
+            "url": url, "locations": [], "location_str": "",
+            "department": "Apple", "updated_at": "", "pay_range": "",
+            "content_text": msg, "_source": "apple-urls",
+        }
+
+    m = _APPLE_HYDRATION_RE.search(html_text)
+    if not m:
+        return fail("(__staticRouterHydrationData not found in HTML)")
+    try:
+        data = json.loads(json.loads('"' + m.group(1) + '"'))
+    except (json.JSONDecodeError, ValueError) as e:
+        return fail(f"(hydration blob JSON parse failed: {e})")
+
+    jd = ((data.get("loaderData") or {}).get("jobDetails") or {}).get("jobsData") or {}
+    if not jd:
+        return fail("(loaderData.jobDetails.jobsData missing from hydration blob)")
+
+    title = (jd.get("postingTitle") or "").strip()
+
+    locs = []
+    for loc in jd.get("locations") or []:
+        city = (loc.get("city") or "").strip()
+        state = (loc.get("stateProvince") or "").strip()
+        name = (loc.get("name") or "").strip()
+        s = f"{city}, {state}" if city and state else (name or city)
+        if s and s not in locs:
+            locs.append(s)
+
+    team = ", ".join(t for t in (jd.get("teamNames") or []) if t) or "Apple"
+
+    parts = []
+    for label, key in [
+        ("Summary", "jobSummary"),
+        ("Description", "description"),
+        ("Responsibilities", "responsibilities"),
+        ("Minimum qualifications", "minimumQualifications"),
+        ("Preferred qualifications", "preferredQualifications"),
+    ]:
+        v = jd.get(key)
+        if v:
+            parts.append(f"**{label}**\n\n" + strip_html(str(v)))
+
+    pay_range = ""
+    for footer in jd.get("postingFooters") or []:
+        for f in ((footer.get("localizations") or {}).get("en_US") or []):
+            fname = (f.get("name") or "Posting footer").strip()
+            content = strip_html(f.get("content") or "")
+            if not content:
+                continue
+            parts.append(f"**{fname}**\n\n" + content)
+            if not pay_range and "pay" in fname.lower():
+                pm = _APPLE_PAY_RE.search(content)
+                if pm:
+                    lo = int(float(pm.group(1).replace(",", "")))
+                    hi = int(float(pm.group(2).replace(",", "")))
+                    pay_range = f"${lo:,} - ${hi:,} USD"
+
+    extras = []
+    if jd.get("employmentType"):
+        extras.append(f"Employment type: {jd['employmentType']}")
+    if jd.get("homeOffice") is not None:
+        extras.append(f"Home office: {jd['homeOffice']}")
+    if extras:
+        parts.append("**Attributes:** " + " | ".join(extras))
+
+    return {
+        "id": jd.get("jobNumber") or job_id,
+        "title": title,
+        "url": url,
+        "locations": locs,
+        "location_str": " | ".join(locs),
+        "department": team,
+        "updated_at": jd.get("postDateInGMT") or "",
+        "pay_range": pay_range,
+        "content_text": "\n\n".join(parts).strip(),
+        "_source": "apple-urls",
+    }
+
+
+def fetch_apple_urls(urls, sleep_s=1.0):
+    out = []
+    for i, url in enumerate(urls, 1):
+        try:
+            html_text = _apple_get_text(url)
+            listing = parse_apple_listing(html_text, url)
+            out.append(listing)
+            print(f"  [{i}/{len(urls)}] {listing['title'][:60]} | "
+                  f"{listing['location_str']} | {listing['pay_range']}",
+                  file=sys.stderr)
+        except Exception as e:
+            out.append({
+                "id": "", "title": url.rsplit("/", 2)[-2], "url": url,
+                "locations": [], "location_str": "", "department": "Apple",
+                "updated_at": "", "pay_range": "",
+                "content_text": f"(fetch failed: {type(e).__name__}: {e})",
+                "_source": "apple-urls",
+            })
+            print(f"  [{i}/{len(urls)}] FAIL {url}: {e}", file=sys.stderr)
+        if i < len(urls) and sleep_s:
+            time.sleep(sleep_s)
+    return out
+
+
 # ---- Lever ---------------------------------------------------------------
 
 def fetch_lever(company):
@@ -1475,6 +1736,22 @@ def fetch_all(company, ats, urls_file=None):
         if not urls:
             raise SystemExit(f"no URLs found in {urls_file!r}")
         return fetch_stripe_urls(urls), "done"
+    if ats == "oracle-urls":
+        if not urls_file:
+            raise SystemExit("--ats oracle-urls requires --urls-file")
+        urls = [ln.strip() for ln in pathlib.Path(urls_file).read_text().splitlines()
+                if ln.strip() and not ln.strip().startswith("#")]
+        if not urls:
+            raise SystemExit(f"no URLs found in {urls_file!r}")
+        return fetch_oracle_urls(urls), "done"
+    if ats == "apple-urls":
+        if not urls_file:
+            raise SystemExit("--ats apple-urls requires --urls-file")
+        urls = [ln.strip() for ln in pathlib.Path(urls_file).read_text().splitlines()
+                if ln.strip() and not ln.strip().startswith("#")]
+        if not urls:
+            raise SystemExit(f"no URLs found in {urls_file!r}")
+        return fetch_apple_urls(urls), "done"
     raise SystemExit(f"unknown --ats {ats!r}")
 
 
@@ -1482,10 +1759,10 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--company", required=True)
     p.add_argument("--ats", default="greenhouse",
-                   choices=["greenhouse", "greenhouse-api", "greenhouse-html",
+                   choices=["apple-urls", "greenhouse", "greenhouse-api", "greenhouse-html",
                             "greenhouse-urls", "lever",
                             "google-urls", "microsoft-urls", "netflix-urls", "openai-urls",
-                            "snap-urls", "stripe-urls", "tiktok-urls"])
+                            "oracle-urls", "snap-urls", "stripe-urls", "tiktok-urls"])
     p.add_argument("--location", default="")
     p.add_argument("--keywords", default="")
     p.add_argument("--urls-file", default="",
