@@ -103,6 +103,105 @@ def fetch_greenhouse_api(company):
     return out
 
 
+# ---- Greenhouse URL-list mode ---------------------------------------------
+#
+# For companies that host listings on a custom domain that blocks scrapers
+# (e.g. www.databricks.com returns 403 to non-browser clients) but whose
+# listing URLs end in a Greenhouse job ID (10-digit, e.g. ...-backend-6779232002
+# or ?gh_jid=6779232002). We extract the ID and hit the per-job board API:
+#   https://boards-api.greenhouse.io/v1/boards/{company}/jobs/{id}?content=true
+# Verified 2026-07-14 against databricks: title, location.name, offices,
+# departments, updated_at, and full (HTML-escaped) content all present.
+# Salary: pay_input_ranges is null for databricks; the band lives in the
+# content HTML as <div class="pay-range"><span>$X</span>...<span>$Y USD</span>.
+# LOCATION CAVEAT (found 2026-07-14, 14/16 Databricks listings affected):
+# `offices` is the RECRUITING-OFFICE record (SF/MV for org-wide pipelines),
+# NOT the posted location. `location.name` matches the live careers page
+# (verified: 8579135002 shows Bellevue on databricks.com; offices said
+# Mountain View). Prefer location.name; offices is fallback only.
+# Multi-location postings separate with ";" in location.name.
+
+_GH_URL_JID_RE = re.compile(r"(?:[?&]gh_jid=|-)(\d{7,})(?:[/?#]|$)")
+_GH_PAY_RANGE_DIV_RE = re.compile(
+    r'class="pay-range"[^>]*>\s*<span[^>]*>\$?\s*([\d,]+)\s*</span>.*?'
+    r'<span[^>]*>\$?\s*([\d,]+)\s*(?:USD)?\s*</span>',
+    re.DOTALL | re.I,
+)
+
+
+def fetch_greenhouse_job(company, job_id):
+    url = f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs/{job_id}?content=true"
+    job = _get_json(url)
+    # location.name is the posted location (matches the live careers page);
+    # offices is the recruiting-office record and is often wrong — see caveat above.
+    loc_name = (job.get("location") or {}).get("name") or ""
+    locs = [s.strip() for s in loc_name.split(";") if s.strip()]
+    if not locs:
+        locs = [o["name"] for o in (job.get("offices") or []) if o.get("name")]
+    dept = ", ".join(d.get("name", "") for d in (job.get("departments") or []) if d.get("name"))
+    content_html = htmllib.unescape(job.get("content") or "")
+
+    pay_range = ""
+    pay = job.get("pay_input_ranges") or []
+    if pay:
+        pr = pay[0]
+        lo = pr.get("min_cents", 0) // 100
+        hi = pr.get("max_cents", 0) // 100
+        pay_range = f"${lo:,} - ${hi:,} {pr.get('currency_code', 'USD')}"
+    else:
+        pm = _GH_PAY_RANGE_DIV_RE.search(content_html)
+        if pm:
+            pay_range = f"${pm.group(1)} - ${pm.group(2)} USD"
+
+    return {
+        "id": str(job.get("id", job_id)),
+        "title": (job.get("title") or "").strip(),
+        "url": job.get("absolute_url", ""),
+        "locations": locs,
+        "location_str": " | ".join(locs),
+        "department": dept,
+        "updated_at": job.get("updated_at", ""),
+        "first_published": job.get("first_published", ""),
+        "pay_range": pay_range,
+        "content_text": strip_html(content_html),
+        "_source": "greenhouse-urls",
+    }
+
+
+def fetch_greenhouse_urls(company, urls, sleep_s=1.0):
+    out = []
+    for i, url in enumerate(urls, 1):
+        jid_m = _GH_URL_JID_RE.search(url)
+        if not jid_m:
+            out.append({
+                "id": "", "title": url.rsplit("/", 1)[-1], "url": url,
+                "locations": [], "location_str": "", "department": company,
+                "updated_at": "", "pay_range": "",
+                "content_text": "(no Greenhouse job ID found in URL)",
+                "_source": "greenhouse-urls",
+            })
+            print(f"  [{i}/{len(urls)}] SKIP no gh job id: {url}", file=sys.stderr)
+            continue
+        jid = jid_m.group(1)
+        try:
+            listing = fetch_greenhouse_job(company, jid)
+            listing["url"] = url  # keep the original careers-site URL
+            out.append(listing)
+            print(f"  [{i}/{len(urls)}] {listing['title'][:60]} | {listing['location_str']} | {listing['pay_range']}", file=sys.stderr)
+        except Exception as e:
+            out.append({
+                "id": jid, "title": url.rsplit("/", 1)[-1], "url": url,
+                "locations": [], "location_str": "", "department": company,
+                "updated_at": "", "pay_range": "",
+                "content_text": f"(fetch failed: {type(e).__name__}: {e})",
+                "_source": "greenhouse-urls",
+            })
+            print(f"  [{i}/{len(urls)}] FAIL {url}: {e}", file=sys.stderr)
+        if i < len(urls) and sleep_s:
+            time.sleep(sleep_s)
+    return out
+
+
 # ---- Greenhouse HTML fallback --------------------------------------------
 
 _JOB_BLOCK_RE = re.compile(
@@ -1312,6 +1411,14 @@ def fetch_all(company, ats, urls_file=None):
         return fetch_greenhouse_html_index(company), "needed"
     if ats == "lever":
         return fetch_lever(company), "done"
+    if ats == "greenhouse-urls":
+        if not urls_file:
+            raise SystemExit("--ats greenhouse-urls requires --urls-file")
+        urls = [ln.strip() for ln in pathlib.Path(urls_file).read_text().splitlines()
+                if ln.strip() and not ln.strip().startswith("#")]
+        if not urls:
+            raise SystemExit(f"no URLs found in {urls_file!r}")
+        return fetch_greenhouse_urls(company, urls), "done"
     if ats == "google-urls":
         if not urls_file:
             raise SystemExit("--ats google-urls requires --urls-file")
@@ -1375,7 +1482,8 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--company", required=True)
     p.add_argument("--ats", default="greenhouse",
-                   choices=["greenhouse", "greenhouse-api", "greenhouse-html", "lever",
+                   choices=["greenhouse", "greenhouse-api", "greenhouse-html",
+                            "greenhouse-urls", "lever",
                             "google-urls", "microsoft-urls", "netflix-urls", "openai-urls",
                             "snap-urls", "stripe-urls", "tiktok-urls"])
     p.add_argument("--location", default="")
